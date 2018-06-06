@@ -24,6 +24,7 @@ constexpr int DEFAULT_ESTIMATOR = FirstSpy;
 constexpr double DEFAULT_INBOUND_SCALE = 0.5;
 constexpr int DEFAULT_THETA = 1;
 constexpr int DEFAULT_THREADS = 8;
+constexpr int DEFAULT_BUCKETS = 8;
 
 int g_num_threads = DEFAULT_THREADS;
 
@@ -35,7 +36,8 @@ struct Options {
     int simtype = DEFAULT_SIMTYPE;
     int estimator = DEFAULT_ESTIMATOR;
     double inbound_scale = DEFAULT_INBOUND_SCALE;
-    int theta = DEFAULT_THETA;
+    int theta = DEFAULT_THETA; // only relevant for basic DiffusionSpreader
+    int buckets = DEFAULT_BUCKETS; // only relevant for bucketed diffusion spreader
 
     void Print() {
         printf("Using %d nodes in graph\n", num_nodes);
@@ -45,7 +47,11 @@ struct Options {
         printf("Setting simtype = %s\n", simtype == BasicDiffusion ? "basic diffusion" : "bucketed diffusion");
         printf("Setting estimator = %s\n", estimator == FirstSpy ? "first spy" : estimator == MLSim ? "ML simulation" : "MLShortestPath");
         printf("Using %f as scale parameter for inbound nodes in diffusion model\n", inbound_scale);
-        printf("Using adversary theta = %d\n", theta);
+        if (simtype != BucketedDiffusion) {
+            printf("Using adversary theta = %d\n", theta);
+        } else {
+            printf("Using %d inbound buckets for diffusion model\n", buckets);
+        }
     }
 };
 
@@ -54,19 +60,19 @@ struct Options {
  *
  * 1) add command line selection of:
  *    a) number of nodes / number of outbound connections [done]
- *    b) which diffusion model to use
+ *    b) which diffusion model to use [done]
  *    c) how many trials to run [done]
- *    d) how many trials to run before creating a new graph
- *    e) what the inbound relay delay should be
- *    f) how many buckets if using the bucketed model
- *    g) how many connections for the adversary if using a non-bucketed model
+ *    d) how many trials to run before creating a new graph [eh - now each thread uses a different graph]
+ *    e) what the inbound relay delay should be [done]
+ *    f) how many buckets if using the bucketed model [done]
+ *    g) how many connections for the adversary if using a non-bucketed model [done]
  * 2) Add smarter estimators:
  *    a) maximum likelihood
  *    b) reporting centrality / rumor centrality?
  * 3) Replace graph implementation with boost graph or some other package so that we can
  *    use graph algorithms that are already written.
  * 4) Add statistics for total network propagation delays.
- * 5) Parallelize the slowest part into multiple threads.
+ * 5) Parallelize the slowest part into multiple threads. [half done]
  */
 
 //-----------------------------------------------------------------------------
@@ -660,9 +666,18 @@ void RunSimulation(const MLShortestPathGammaEstimator &has_paths, const Directed
     }
 }
 
-void RunDiffusionSimulation(const DirectedGraph &graph, int trials, const Options &opt, int *success_count)
+void RunDiffusionSimulation(int trials, const Options &opt, int *success_count)
 {
-    DiffusionSpreader diffusion_spread(graph, -1, (double) opt.theta, opt.inbound_scale);
+    RandomGraph graph(opt.num_nodes, opt.num_outbound);
+    DiffusionSpreaderBucketedInbound *ds_bucket = nullptr;
+    DiffusionSpreader *ds = nullptr;
+
+    if (opt.simtype == BucketedDiffusion) {
+        ds_bucket = new DiffusionSpreaderBucketedInbound(graph, opt.buckets, -1, opt.inbound_scale);
+    } else {
+        ds = new DiffusionSpreader(graph, -1, (double) opt.theta, opt.inbound_scale);
+    }
+    DiffusionSpreader &diffusion_spread = ds_bucket != nullptr ? *ds_bucket : *ds;
     *success_count = 0;
 
     // The ML simulators do graph analysis once, which is then used on each
@@ -697,13 +712,13 @@ void RunDiffusionSimulation(const DirectedGraph &graph, int trials, const Option
 }
 
 // Run a diffusion simulation, in parallel
-void LaunchDiffusionSim(const DirectedGraph &g, const Options& opt)
+void LaunchDiffusionSim(const Options& opt)
 {
     std::thread t[g_num_threads];
     std::vector<int> num_successes(g_num_threads);
 
     for (int i=0; i<g_num_threads; ++i) {
-        t[i] = std::thread(&RunDiffusionSimulation, std::ref(g), opt.num_trials/g_num_threads, std::ref(opt), &num_successes[i]);
+        t[i] = std::thread(&RunDiffusionSimulation, opt.num_trials/g_num_threads, std::ref(opt), &num_successes[i]);
     }
     for (int i=0; i<g_num_threads; ++i) {
         t[i].join();
@@ -735,7 +750,8 @@ int ParseArguments(int ac, char **av, Options &options)
                                         "\t2 == ML simulation estimator\n"
                                         "\t3 == ML shortest-path-gamma estimator\n")
         ("inboundscale", po::value<double>(), "pick an inbound scaling constant (default 0.5)")
-        ("adversarytheta", po::value<int>(), "set number of adversary connections to each node") 
+        ("adversarytheta", po::value<int>(), "set number of adversary connections to each node (for basic diffusion only)") 
+        ("buckets", po::value<int>(), "set number of timing buckets for inbound peer tx relay (for bucketed diffusion only)") 
         ("threads", po::value<int>(), "set number of threads to use")
     ;
 
@@ -777,7 +793,18 @@ int ParseArguments(int ac, char **av, Options &options)
     }
 
     if (vm.count("adversarytheta")) {
+        if (options.simtype == BucketedDiffusion) {
+            printf("--adversarytheta not applicable to BucketedDiffusion! (see --help)\n");
+            return 1;
+        }
         options.theta = vm["adversarytheta"].as<int>();
+    }
+    if (vm.count("buckets")) {
+        if (options.simtype == BasicDiffusion) {
+            printf("--buckets not applicable to basic diffusion! (see --help)\n");
+            return 1;
+        }
+        options.buckets = vm["buckets"].as<int>();
     }
     } catch(...) {
         printf("Unhandled exception (misparsed argument?), exiting\n");   
@@ -794,71 +821,12 @@ int main(int ac, char* av[])
     opt.Print();
 
     // Create a random graph to use for our simulations.
-    RandomGraph g(opt.num_nodes, opt.num_outbound);
+    //RandomGraph g(opt.num_nodes, opt.num_outbound);
     //PrintGraph(g);
 
     int num_correct = 0;
 
-    if (opt.simtype == BasicDiffusion) {
-        LaunchDiffusionSim(g, opt);
-        return 0;
-    }
-    #if 0
-    //for (double theta=1.0; theta<8.5; theta += 1.0) {
-        //DiffusionSpreader diffusion_spread(g, -1, theta, 0.5);
-        //DiffusionSpreader diffusion_spread_gmax(g, -1, theta, 0.25);
-    for (int num_buckets=1; num_buckets<9; ++num_buckets) {
-        DiffusionSpreaderBucketedInbound diffusion_spread_gmax(g, num_buckets, -1, 0.5);
-        for (int i=0; i<num_trials; ++i) {
-            // Create a diffusion spreading model and spread a message.
-            diffusion_spread_gmax.Reset(-1);
-            diffusion_spread_gmax.SpreadMessage();
-
-            FirstSpyEstimator first_spy(diffusion_spread_gmax);
-
-            if (first_spy.EstimateSource() == diffusion_spread_gmax.m_source) {
-                ++num_correct;
-            }
-        }
-        printf("buckets: %d %d / %d = %.2f accuracy\n", num_buckets, num_correct, num_trials, 100.0*num_correct/num_trials);
-        num_correct=0;
-    }
-    #endif
-
-    DiffusionSpreader diffusion_spread(g);
-    //MLSimEstimator ml_est(diffusion_spread);
-    MLShortestPathGammaEstimator ml_est(diffusion_spread);
-
-    printf("Done creating estimator\n");
-
-    std::vector<int> num_successes(g_num_threads);
-    std::thread threads[g_num_threads];
-
-    for (int i=0; i<g_num_threads; ++i) {
-        threads[i] = std::thread(&RunSimulation, std::ref(ml_est), g, opt.num_trials/g_num_threads, &num_successes[i]);
-    }
-    for (int i=0; i<g_num_threads; ++i) {
-        threads[i].join();
-    }
-    printf("\n");
-    int total_successes = 0;
-    for (auto s : num_successes) {
-        total_successes += s;
-    }
-    printf("%d / %d = %.2f accuracy\n", total_successes, g_num_threads * (opt.num_trials/g_num_threads), 1.0*total_successes / (g_num_threads * (opt.num_trials/g_num_threads)));
-
-    /*
-    for (int i=0; i<num_trials; ++i) {
-        diffusion_spread.Reset(-1);
-        diffusion_spread.SpreadMessage();
-        if (ml_est.EstimateSource() == diffusion_spread.m_source) {
-            ++num_correct;
-        }
-    }
-    printf("%d / %d = %.2f accuracy\n", num_correct, num_trials, 100.0*num_correct/num_trials);
-    */
-
-    // PrintAdversaryTimestamps(diffusion_spread);
+    LaunchDiffusionSim(opt);
 
     return 0;
 }
