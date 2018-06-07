@@ -11,6 +11,7 @@
 #include <limits>
 #include <boost/math/distributions/gamma.hpp>
 #include <thread>
+#include <numeric>
 #include <boost/program_options.hpp>
 
 enum { BasicDiffusion = 1, BucketedDiffusion = 2 };
@@ -25,6 +26,7 @@ constexpr double DEFAULT_INBOUND_SCALE = 0.5;
 constexpr int DEFAULT_THETA = 1;
 constexpr int DEFAULT_THREADS = 8;
 constexpr int DEFAULT_BUCKETS = 8;
+constexpr bool DEFAULT_RELAYSTATS = false;
 
 int g_num_threads = DEFAULT_THREADS;
 
@@ -38,6 +40,7 @@ struct Options {
     double inbound_scale = DEFAULT_INBOUND_SCALE;
     int theta = DEFAULT_THETA; // only relevant for basic DiffusionSpreader
     int buckets = DEFAULT_BUCKETS; // only relevant for bucketed diffusion spreader
+    bool relay_stats = DEFAULT_RELAYSTATS;
 
     void Print() {
         printf("Using %d nodes in graph\n", num_nodes);
@@ -52,6 +55,7 @@ struct Options {
         } else {
             printf("Using %d inbound buckets for diffusion model\n", buckets);
         }
+        printf("Will %scalculate propagation statistics\n", relay_stats ? "" : "not ");
     }
 };
 
@@ -312,7 +316,7 @@ void DiffusionSpreader::SpreadMessage()
         size_t source_node = it->second.first;
         size_t target_node = it->second.second;
         assert (!infected_nodes.count(target_node));
-        // printf("Infecting %lu\n", target_node);
+        // printf("Infecting %lu at %f\n", target_node, it->first);
         infected_nodes.insert(target_node);
         received_timestamps[target_node] = it->first;
         adversary_timestamps[target_node] = GetAdversaryTime(target_node);
@@ -666,7 +670,7 @@ void RunSimulation(const MLShortestPathGammaEstimator &has_paths, const Directed
     }
 }
 
-void RunDiffusionSimulation(int trials, const Options &opt, int *success_count)
+void RunDiffusionSimulation(int trials, const Options &opt, int *success_count, std::map<double, std::list<double>> * propagation_delay = nullptr)
 {
     RandomGraph graph(opt.num_nodes, opt.num_outbound);
     DiffusionSpreaderBucketedInbound *ds_bucket = nullptr;
@@ -695,6 +699,16 @@ void RunDiffusionSimulation(int trials, const Options &opt, int *success_count)
     for (int i=0; i<trials; ++i) {
         diffusion_spread.Reset(-1); // clear state and pick a random new source node
         diffusion_spread.SpreadMessage();
+        if (propagation_delay != nullptr) {
+            std::vector<double> data(diffusion_spread.received_timestamps);
+            std::sort(data.begin(), data.end());
+            size_t num_elements = data.size();
+            for (auto it = propagation_delay->begin(); it != propagation_delay->end(); ++it) {
+                double pct = it->first;
+                int lookup = std::max(0, int(num_elements*pct - 1));
+                it->second.push_back(data[lookup]);
+            }
+        }
         size_t estimate = -1;
 
         if (opt.estimator == FirstSpy) {
@@ -716,10 +730,21 @@ void LaunchDiffusionSim(const Options& opt)
 {
     std::thread t[g_num_threads];
     std::vector<int> num_successes(g_num_threads);
+    std::map<int, std::map<double, std::list<double>>> propagation_data;
 
     for (int i=0; i<g_num_threads; ++i) {
-        t[i] = std::thread(&RunDiffusionSimulation, opt.num_trials/g_num_threads, std::ref(opt), &num_successes[i]);
+        if (opt.relay_stats) {
+            propagation_data[i][0.05];
+            propagation_data[i][0.10];
+            propagation_data[i][0.50];
+            propagation_data[i][0.75];
+            propagation_data[i][0.95];
+            propagation_data[i][0.99];
+            propagation_data[i][1.00];
+        }
+        t[i] = std::thread(&RunDiffusionSimulation, opt.num_trials/g_num_threads, std::ref(opt), &num_successes[i], opt.relay_stats ? &propagation_data[i] : nullptr);
     }
+
     for (int i=0; i<g_num_threads; ++i) {
         t[i].join();
     }
@@ -731,6 +756,23 @@ void LaunchDiffusionSim(const Options& opt)
     }
     int num_runs = g_num_threads * (opt.num_trials / g_num_threads);
     printf("success %d / %d = %.2f\n", total_success, num_runs, double(total_success)/num_runs);
+
+    // Tally relay statistics. Output mean time to reach each fraction of nodes.
+    if (opt.relay_stats) {
+        std::map<double, double> summary;
+        for (auto map_it = propagation_data.begin(); map_it != propagation_data.end(); ++map_it) {
+            for (auto it = map_it->second.begin(); it != map_it->second.end(); ++it) {
+                assert(it->second.size() == opt.num_trials / g_num_threads);
+                if (summary.count(it->first) == 0) summary[it->first] = 0;
+                summary[it->first] += std::accumulate(it->second.begin(), it->second.end(), 0.);
+            }
+        }
+        printf("Relay distribution - mean time to reach each percentile of nodes:\n");
+        for (auto it = summary.begin(); it != summary.end(); ++it) {
+            it->second /= num_runs;
+            printf("%.2f %f\n", it->first, it->second);
+        }
+    }
 }
 
 int ParseArguments(int ac, char **av, Options &options)
@@ -753,6 +795,7 @@ int ParseArguments(int ac, char **av, Options &options)
         ("adversarytheta", po::value<int>(), "set number of adversary connections to each node (for basic diffusion only)") 
         ("buckets", po::value<int>(), "set number of timing buckets for inbound peer tx relay (for bucketed diffusion only)") 
         ("threads", po::value<int>(), "set number of threads to use")
+        ("relaystats", po::value<bool>(), "set whether to output distribution statistics");
     ;
 
     try {
@@ -805,6 +848,9 @@ int ParseArguments(int ac, char **av, Options &options)
             return 1;
         }
         options.buckets = vm["buckets"].as<int>();
+    }
+    if (vm.count("relaystats")) {
+        options.relay_stats = vm["relaystats"].as<bool>();
     }
     } catch(...) {
         printf("Unhandled exception (misparsed argument?), exiting\n");   
