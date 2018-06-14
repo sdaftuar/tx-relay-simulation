@@ -18,6 +18,7 @@ enum { BasicDiffusion = 1, BucketedDiffusion = 2 };
 enum { FirstSpy = 1, MLSim = 2, MLShortestPath = 3 };
 
 constexpr int DEFAULT_NODES = 1000;
+constexpr int DEFAULT_INBOUND_NODES = 0; // nodes that are not listening
 constexpr int DEFAULT_OUTBOUND = 6;
 constexpr int DEFAULT_TRIALS = 1000;
 constexpr int DEFAULT_SIMTYPE = BasicDiffusion;
@@ -31,7 +32,8 @@ constexpr bool DEFAULT_RELAYSTATS = false;
 int g_num_threads = DEFAULT_THREADS;
 
 struct Options {
-    int num_nodes = DEFAULT_NODES;
+    int num_nodes = DEFAULT_NODES; // listening nodes
+    int num_inbound_nodes = DEFAULT_INBOUND_NODES; // non-listening nodes
     int num_outbound = DEFAULT_OUTBOUND;
     int num_trials = DEFAULT_TRIALS;
     // num_threads is a global, for now
@@ -43,7 +45,8 @@ struct Options {
     bool relay_stats = DEFAULT_RELAYSTATS;
 
     void Print() {
-        printf("Using %d nodes in graph\n", num_nodes);
+        printf("Using %d listening nodes in graph\n", num_nodes);
+        printf("Using %d non-listening nodes in graph\n", num_inbound_nodes);
         printf("Using %d outbound edges per node\n", num_outbound);
         printf("Running %d trials\n", num_trials);
         printf("Using %d threads\n", g_num_threads);
@@ -139,22 +142,26 @@ DirectedGraph::vertex_set DirectedGraph::GetNeighbors(size_t node)
 // the inbound from the outbound edges.
 class RandomGraph : public DirectedGraph {
 public:
-    RandomGraph(int num_vertices, int num_outbound);
+    RandomGraph(int num_vertices, int num_outbound, int num_inbound_only);
     virtual ~RandomGraph() {}
 };
 
-RandomGraph::RandomGraph(int num_vertices, int num_outbound)
-    : DirectedGraph(num_vertices)
+RandomGraph::RandomGraph(int num_vertices, int num_outbound, int num_inbound_only)
+    : DirectedGraph(num_vertices+num_inbound_only)
 {
     std::random_device rd;
     std::mt19937 g(rd());
     std::vector<unsigned int> node_indices;
 
+    // Put all the listening nodes in a vector, which we'll randomly permute
+    // and draw from
     for (unsigned int i=0; i<num_vertices; ++i) {
         node_indices.push_back(i);
     }
 
-    for (unsigned int i=0; i<num_vertices; ++i) {
+    // For each node, listening or not, we'll select num_outbound peers from
+    // the listening set.
+    for (unsigned int i=0; i<num_vertices+num_inbound_only; ++i) {
         std::shuffle(node_indices.begin(), node_indices.end(), g);
         int edges = 0;
         auto vertex_it = node_indices.begin();
@@ -234,6 +241,10 @@ public:
     std::vector<double> adversary_timestamps;
     std::vector<double> received_timestamps;
 
+    // Track the number of times each node is the first to broadcast a
+    // transaction.
+    std::vector<int> first_broadcasts;
+
     // Random distributions (is this right?)
     std::random_device rd;
     std::mt19937 generator;
@@ -252,6 +263,7 @@ DiffusionSpreader::DiffusionSpreader(const DirectedGraph &g, size_t source, doub
     }
     adversary_timestamps.resize(m_graph.NumNodes(), -1);
     received_timestamps.resize(m_graph.NumNodes(), -1);
+    first_broadcasts.resize(m_graph.NumNodes(), 0);
 }
 
 double DiffusionSpreader::GetBroadcastTime(size_t source, size_t target, bool inbound)
@@ -280,6 +292,7 @@ void DiffusionSpreader::Reset(size_t source)
     for (size_t i=0; i<received_timestamps.size(); ++i) {
         adversary_timestamps[i] = -1;
         received_timestamps[i] = -1;
+        first_broadcasts[i] = 0;
     }
 }
 
@@ -315,6 +328,7 @@ void DiffusionSpreader::SpreadMessage()
                                         // the first entry
         size_t source_node = it->second.first;
         size_t target_node = it->second.second;
+        ++first_broadcasts[source_node];
         assert (!infected_nodes.count(target_node));
         // printf("Infecting %lu at %f\n", target_node, it->first);
         infected_nodes.insert(target_node);
@@ -670,9 +684,9 @@ void RunSimulation(const MLShortestPathGammaEstimator &has_paths, const Directed
     }
 }
 
-void RunDiffusionSimulation(int trials, const Options &opt, int *success_count, std::map<double, std::list<double>> * propagation_delay = nullptr)
+void RunDiffusionSimulation(int trials, const Options &opt, int *success_count, std::map<double, std::list<double>> * propagation_delay = nullptr, std::map<int, int> * relay_histogram = nullptr)
 {
-    RandomGraph graph(opt.num_nodes, opt.num_outbound);
+    RandomGraph graph(opt.num_nodes, opt.num_outbound, opt.num_inbound_nodes);
     DiffusionSpreaderBucketedInbound *ds_bucket = nullptr;
     DiffusionSpreader *ds = nullptr;
 
@@ -709,6 +723,11 @@ void RunDiffusionSimulation(int trials, const Options &opt, int *success_count, 
                 it->second.push_back(data[lookup]);
             }
         }
+        if (relay_histogram != nullptr) {
+            for (size_t i=0; i<diffusion_spread.first_broadcasts.size(); ++i) {
+                ++(*relay_histogram)[diffusion_spread.first_broadcasts[i]];
+            }
+        }
         size_t estimate = -1;
 
         if (opt.estimator == FirstSpy) {
@@ -731,6 +750,10 @@ void LaunchDiffusionSim(const Options& opt)
     std::thread t[g_num_threads];
     std::vector<int> num_successes(g_num_threads);
     std::map<int, std::map<double, std::list<double>>> propagation_data;
+    // Keep a histogram of the number of nodes that broadcasted a transaction a
+    // given number of times.
+    // relay_histogram: <relay count> --> <number of nodes>
+    std::map<int, int> relay_histogram[g_num_threads];
 
     for (int i=0; i<g_num_threads; ++i) {
         if (opt.relay_stats) {
@@ -742,7 +765,7 @@ void LaunchDiffusionSim(const Options& opt)
             propagation_data[i][0.99];
             propagation_data[i][1.00];
         }
-        t[i] = std::thread(&RunDiffusionSimulation, opt.num_trials/g_num_threads, std::ref(opt), &num_successes[i], opt.relay_stats ? &propagation_data[i] : nullptr);
+        t[i] = std::thread(&RunDiffusionSimulation, opt.num_trials/g_num_threads, std::ref(opt), &num_successes[i], opt.relay_stats ? &propagation_data[i] : nullptr, opt.relay_stats ? &relay_histogram[i] : nullptr);
     }
 
     for (int i=0; i<g_num_threads; ++i) {
@@ -759,6 +782,16 @@ void LaunchDiffusionSim(const Options& opt)
 
     // Tally relay statistics. Output mean time to reach each fraction of nodes.
     if (opt.relay_stats) {
+        std::map<int, int> overall_histogram;
+        for (size_t i=0; i<g_num_threads; ++i) {
+            for (auto it = relay_histogram[i].begin(); it != relay_histogram[i].end(); ++it) {
+                overall_histogram[it->first] += it->second;
+            }
+        }
+        printf("Relay count histogram\n");
+        for (auto it=overall_histogram.begin(); it != overall_histogram.end(); ++it) {
+            printf("%d %d\n", it->first, it->second);
+        }
         std::map<double, double> summary;
         for (auto map_it = propagation_data.begin(); map_it != propagation_data.end(); ++map_it) {
             for (auto it = map_it->second.begin(); it != map_it->second.end(); ++it) {
@@ -781,7 +814,8 @@ int ParseArguments(int ac, char **av, Options &options)
     po::options_description desc("Allowed options");
     desc.add_options()
         ("help", "produce help message")
-        ("nodes", po::value<int>(), "set number of nodes in graph")
+        ("nodes", po::value<int>(), "set number of listening nodes in graph")
+        ("inbound_only", po::value<int>(), "set number of non-listening nodes in graph")
         ("outbound", po::value<int>(), "set number of outbound edges per node")
         ("trials", po::value<int>(), "set number of simulations to run")
         ("simtype", po::value<int>(), "pick a spreading model:\n"
@@ -810,6 +844,10 @@ int ParseArguments(int ac, char **av, Options &options)
 
     if (vm.count("nodes")) {
         options.num_nodes = vm["nodes"].as<int>();
+    }
+
+    if (vm.count("inbound_only")) {
+        options.num_inbound_nodes = vm["inbound_only"].as<int>();
     }
     if (vm.count("outbound")) {
         options.num_outbound = vm["outbound"].as<int>();
